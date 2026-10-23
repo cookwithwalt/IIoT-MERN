@@ -1,0 +1,56 @@
+import 'dotenv/config';
+import express from 'express';
+import http from 'node:http';
+import cors from 'cors';
+import helmet from 'helmet';
+import mongoose from 'mongoose';
+import { Server as SocketServer } from 'socket.io';
+import { z } from 'zod';
+import { SimulationEngine } from './simulation/engine.js';
+
+const app = express();
+const server = http.createServer(app);
+const io = new SocketServer(server, { cors: { origin: process.env.CLIENT_ORIGIN || 'http://localhost:5173' } });
+const engine = new SimulationEngine({ seed: Number(process.env.SIM_SEED) || 20261023 });
+const port = Number(process.env.PORT) || 4000;
+app.use(helmet());
+app.use(cors({ origin: process.env.CLIENT_ORIGIN || 'http://localhost:5173' }));
+app.use(express.json({ limit: '100kb' }));
+app.use((req, res, next) => { req.setTimeout(10000); next(); });
+let interval = null;
+const emitSnapshot = () => { const state = engine.snapshot(); io.emit('simulation:status', state); io.emit('machine:state', state.machines); io.emit('telemetry:update', engine.telemetry.slice(-4)); };
+const startLoop = () => { if (interval) return; engine.status = 'RUNNING'; interval = setInterval(() => { engine.tick(1); emitSnapshot(); }, Math.max(100, Number(process.env.SIM_TICK_MS) || 1000)); };
+const stopLoop = () => { if (interval) clearInterval(interval); interval = null; engine.status = 'PAUSED'; emitSnapshot(); };
+app.get('/api/health', (_req, res) => res.json({ ok: true, service: 'linepulse-api', database: mongoose.connection.readyState === 1 ? 'connected' : 'not-connected', timestamp: new Date().toISOString() }));
+app.get('/api/simulation/status', (_req, res) => res.json(engine.snapshot()));
+app.get('/api/dashboard/summary', (_req, res) => res.json({ metrics: engine.snapshot().metrics, status: engine.status, clockSeconds: engine.clockSeconds }));
+app.get('/api/machines', (_req, res) => res.json({ machines: engine.snapshot().machines }));
+app.get('/api/machines/:id', (req, res) => { const m = engine.machines.find(x => x.id === req.params.id); if (!m) return res.status(404).json({ error: 'Machine not found' }); res.json({ machine: m }); });
+app.get('/api/machines/:id/telemetry', (req, res) => { const rows = engine.telemetry.filter(t => t.machineId === req.params.id).slice(-500); res.json({ telemetry: rows }); });
+app.get('/api/telemetry', (req, res) => { const limit = Math.min(1000, Math.max(1, Number(req.query.limit) || 100)); res.json({ telemetry: engine.telemetry.slice(-limit) }); });
+app.get('/api/events', (req, res) => { const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 50)); res.json({ events: engine.events.slice(0, limit) }); });
+app.get('/api/incidents', (_req, res) => res.json({ incidents: engine.events.filter(e => e.category === 'INITIATING_FAULT' || e.category === 'PROPAGATED_CONSEQUENCE' || e.category === 'RECOVERY') }));
+app.get('/api/incidents/:id', (req, res) => { const e = engine.events.find(x => x.id === req.params.id); if (!e) return res.status(404).json({ error: 'Incident not found' }); res.json({ incident: e }); });
+app.get('/api/analytics/production', (_req, res) => res.json({ metrics: engine.snapshot().metrics, stations: engine.machines.map(m => ({ id: m.id, name: m.name, processed: m.processed, blockedSeconds: m.blockedSeconds, starvedSeconds: m.starvedSeconds })) }));
+app.get('/api/analytics/downtime', (_req, res) => res.json({ lineDowntimeSeconds: engine.lineDowntimeSeconds, stations: engine.machines.map(m => ({ id: m.id, name: m.name, blockedSeconds: m.blockedSeconds, starvedSeconds: m.starvedSeconds, faultSeconds: m.faultSeconds })) }));
+app.get('/api/simulation/config', (_req, res) => res.json({ tickMs: Number(process.env.SIM_TICK_MS) || 1000, seed: engine.seed }));
+app.post('/api/simulation/start', (_req, res) => { startLoop(); res.json({ ok: true, status: engine.status }); });
+app.post('/api/simulation/resume', (_req, res) => { startLoop(); res.json({ ok: true, status: engine.status }); });
+app.post('/api/simulation/pause', (_req, res) => { stopLoop(); res.json({ ok: true, status: engine.status }); });
+app.post('/api/simulation/reset', (_req, res) => { if (interval) clearInterval(interval); interval = null; engine.reset(); emitSnapshot(); res.json(engine.snapshot()); });
+app.post('/api/simulation/faults', (req, res) => {
+  const schema = z.object({ station: z.string().min(1), type: z.string(), severity: z.enum(['warning', 'critical']).optional(), durationSeconds: z.number().min(5).max(3600) });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'Invalid fault payload', details: parsed.error.flatten() });
+  try { const fault = engine.injectFault(parsed.data); startLoop(); emitSnapshot(); io.emit('incident:created', fault); res.status(201).json({ fault }); } catch (e) { res.status(422).json({ error: e.message }); }
+});
+app.delete('/api/simulation/faults/:id', (req, res) => { try { const fault = engine.clearFault(req.params.id); emitSnapshot(); io.emit('incident:updated', fault); res.json({ fault }); } catch (e) { res.status(404).json({ error: e.message }); } });
+app.post('/api/simulation/scenarios', (req, res) => { try { engine.applyScenario(req.body?.name); startLoop(); emitSnapshot(); res.json({ ok: true, snapshot: engine.snapshot() }); } catch (e) { res.status(422).json({ error: e.message }); } });
+app.get('/api/reports/telemetry.csv', (_req, res) => { const rows = engine.telemetry; const csv = ['simulationTime,machineId,state,readings', ...rows.map(t => [t.simulationTime, t.machineId, t.state, JSON.stringify(t.readings)].map(v => '"' + String(v ?? '').replaceAll('"', '""') + '"').join(','))].join('\n'); res.type('text/csv').attachment('linepulse-telemetry.csv').send(csv); });
+app.get('/api/reports/production', (_req, res) => res.json({ generatedAt: new Date().toISOString(), simulationTime: engine.clockSeconds, metrics: engine.snapshot().metrics, machines: engine.machines.map(m => ({ name: m.name, processed: m.processed, state: m.state })) }));
+io.on('connection', socket => { socket.emit('simulation:status', engine.snapshot()); socket.on('disconnect', () => {}); });
+let shuttingDown = false;
+async function shutdown() { if (shuttingDown) return; shuttingDown = true; if (interval) clearInterval(interval); await mongoose.disconnect().catch(() => {}); server.close(() => process.exit(0)); setTimeout(() => process.exit(1), 5000).unref(); }
+process.on('SIGINT', shutdown); process.on('SIGTERM', shutdown);
+if (process.env.MONGODB_URI) mongoose.connect(process.env.MONGODB_URI).then(() => console.log('MongoDB connected')).catch(err => console.error('MongoDB connection failed:', err.message));
+server.listen(port, () => console.log('LinePulse API listening on :' + port));
